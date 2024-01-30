@@ -432,3 +432,124 @@ for feature in features_importance.keys():
 ```
 
 本代码到此结束
+
+## 第一次更改
+
+### 新增内容
+
+#### 删除脱敏数据（以NN结尾）
+
+代码：
+
+``def is_not_nn_column(col_name):
+    return not col_name.endswith("NN")
+data = data.select(*(F.col(c) for c in data.columns if is_not_nn_column(c)))``
+
+结果：6条数据被删除
+
+
+
+#### 对空值进行均值填充
+
+首先查找空值存在的列
+
+代码：
+
+``def count_null_values(df):
+    null_counts = df.select([F.sum(F.col(c).isNull().cast("int")).alias(c) for c in df.columns])
+    return null_counts
+null_values = count_null_values(data)
+null_values.show()``
+
+其次：获取存在null的列名
+
+代码： 
+
+``not_zero_columns = []
+for col_name,col_val in zip(null_values.columns,null_values.collect()[0]):
+    if col_val != 0:
+        not_zero_columns.append(col_name)``
+
+最后对其进行均值填充
+
+代码：
+
+``mean_value = data.select(F.mean(*not_zero_columns)).collect()[0][0]
+data=data.fillna(mean_value,subset=not_zero_columns)``
+
+
+
+#### 采用4分位数进行异常值处理
+
+代码：
+
+``for column_name in continuous_columns:
+    *#* *计算第一四分位数和第三四分位数
+    q1 = data.select(F.percentile_approx(F.col(column_name), 0.25))
+    q3 = data.select(F.percentile_approx(F.col(column_name), 0.75))
+    *#* *计算**IQR
+    iqr = q3.collect()[0][0] - q1.collect()[0][0]
+    *#* *计算异常值的阈值
+    lower_bound = q1.collect()[0][0] - 1.5 * iqr
+    upper_bound = q3.collect()[0][0] + 1.5 * iqr
+    *#* *计算均值
+    mean_value = data.select(F.mean(column_name)).collect()[0][0]
+    data = data.withColumn(column_name, F.when(((F.col(column_name) < lower_bound) | (F.col(column_name) > upper_bound)), mean_value).otherwise(F.col(column_name)))``
+
+
+
+#### 观察类别分布情况
+
+代码：
+
+`last_column_name = data.columns[-1]
+result = data.agg(
+    F.sum(F.when(F.col(last_column_name) == 0, 1).otherwise(0)).alias("zero_count"),
+    F.sum(F.when(F.col(last_column_name) == 1, 1).otherwise(0)).alias("one_count")
+).collect()
+for row in result:
+    print(f"Zero Count: {row['zero_count']}, One Count: {row['one_count']}")`
+
+结果：
+
+Zero Count: 15207, One Count: 793
+
+结论：分布不平衡，考虑xgboost中存在解决类不平衡的参数[max_delta_step](https://xgboost.readthedocs.io/en/stable/parameter.html)和[scale_pos_weight](https://xgboost.readthedocs.io/en/stable/parameter.html)
+
+依照官方描述，这里选择前者，目的是不改变实际预测值
+
+
+
+#### XGBoost优化
+
+优化了xgb模型的代码，并使用网格搜索法得到了参数的最优值
+
+代码：
+
+`classifier=SparkXGBClassifier(
+    features_col="feature_subset",
+    label_col=label_col,
+    num_workers=3,
+    max_delta_step = 5,
+    silent = 1,
+    min_child_weight = 1.3,
+    max_depth = 6,
+    prediction_col="prediction",
+    probability_col="probability"
+)`
+
+并且评价指标更改为F-measure，用于针对类不平衡的问题
+
+
+
+### 未变动内容
+
+#### 关于正态检验
+
+考虑到xgboost和pearson并不需要数据满足正态性，代码中其他内容也不需要，故没有增加
+
+
+
+#### 关于提取方法
+
+考虑到XGBoost已近属于集成方法，所以只是对其参数进行调优，并未新增
